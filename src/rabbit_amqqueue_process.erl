@@ -80,6 +80,9 @@
             max_length,
             %% max length in bytes, if configured
             max_bytes,
+            %% an action to perform if queue is to be over a limit,
+            %% can be either drop_head (default) or reject_publish
+            overflow,
             %% when policies change, this version helps queue
             %% determine what previously scheduled/set up state to ignore,
             %% e.g. message expiration messages from previously set up timers
@@ -159,7 +162,8 @@ init_state(Q) ->
                senders             = pmon:new(delegate),
                msg_id_to_channel   = gb_trees:empty(),
                status              = running,
-               args_policy_version = 0},
+               args_policy_version = 0,
+               overflow            = drop_head},
     rabbit_event:init_stats_timer(State, #q.stats_timer).
 
 init_it(Recover, From, State = #q{q = #amqqueue{exclusive_owner = none}}) ->
@@ -378,6 +382,7 @@ process_args_policy(State = #q{q                   = Q,
          {<<"message-ttl">>,             fun res_min/2, fun init_ttl/2},
          {<<"max-length">>,              fun res_min/2, fun init_max_length/2},
          {<<"max-length-bytes">>,        fun res_min/2, fun init_max_bytes/2},
+         {<<"overflow">>,                fun res_arg/2, fun init_overflow/2},
          {<<"queue-mode">>,              fun res_arg/2, fun init_queue_mode/2}],
       drop_expired_msgs(
          lists:foldl(fun({Name, Resolve, Fun}, StateN) ->
@@ -420,6 +425,12 @@ init_max_length(MaxLen, State) ->
 init_max_bytes(MaxBytes, State) ->
     {_Dropped, State1} = maybe_drop_head(State#q{max_bytes = MaxBytes}),
     State1.
+
+init_overflow(undefined, State) ->
+    State;
+init_overflow(Overflow, State) ->
+    %% TODO maybe drop head
+    State#q{overflow = binary_to_existing_atom(Overflow, utf8)}.
 
 init_queue_mode(undefined, State) ->
     State;
@@ -644,6 +655,7 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
             {BQS3, MTC1} = discard(Delivery, BQ, BQS2, MTC),
             State3#q{backing_queue_state = BQS3, msg_id_to_channel = MTC1};
         {undelivered, State3 = #q{backing_queue_state = BQS2}} ->
+
             BQS3 = BQ:publish(Message, Props, Delivered, SenderPid, Flow, BQS2),
             {Dropped, State4 = #q{backing_queue_state = BQS4}} =
                 maybe_drop_head(State3#q{backing_queue_state = BQS3}),
@@ -665,7 +677,9 @@ deliver_or_enqueue(Delivery = #delivery{message = Message,
 maybe_drop_head(State = #q{max_length = undefined,
                            max_bytes  = undefined}) ->
     {false, State};
-maybe_drop_head(State) ->
+maybe_drop_head(State = #q{overflow = reject_publish}) ->
+    {false, State};
+maybe_drop_head(State = #q{overflow = drop_head}) ->
     maybe_drop_head(false, State).
 
 maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
@@ -683,6 +697,31 @@ maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
         false ->
             {AlreadyDropped, State}
     end.
+
+nack_publish_no_space(#delivery{confirm = true,
+                                sender = SenderPid,
+                                msg_seq_no = MsgSeqNo},
+                      _SlaveWhenPublished, State) ->
+    gen_server2:cast(SenderPid, {reject_publish, MsgSeqNo, self()}),
+    State;
+nack_publish_no_space(#delivery{confirm = false},
+                      _SlaveWhenPublished, State) ->
+    State.
+
+will_overflow(_, #q{max_length = undefined,
+                    max_bytes  = undefined}) -> false;
+will_overflow(#delivery{message = Message},
+              #q{max_length          = MaxLen,
+                 max_bytes           = MaxBytes,
+                 backing_queue       = BQ,
+                 backing_queue_state = BQS}) ->
+    ExpectedQueueLength = BQ:len(BQS) + 1,
+
+    #basic_message{content = #content{payload_fragments_rev = PFR}} = Message,
+    MessageSize = iolist_size(PFR),
+    ExpectedQueueSizeBytes = BQ:info(message_bytes_ready, BQS) + MessageSize,
+
+    ExpectedQueueLength > MaxLen orelse ExpectedQueueSizeBytes > MaxBytes.
 
 over_max_length(#q{max_length          = MaxLen,
                    max_bytes           = MaxBytes,
@@ -1250,9 +1289,11 @@ handle_cast({run_backing_queue, Mod, Fun},
             State = #q{backing_queue = BQ, backing_queue_state = BQS}) ->
     noreply(State#q{backing_queue_state = BQ:invoke(Mod, Fun, BQS)});
 
-handle_cast({deliver, Delivery = #delivery{sender = Sender,
-                                           flow   = Flow}, SlaveWhenPublished},
-            State = #q{senders = Senders}) ->
+handle_cast({deliver,
+                Delivery = #delivery{sender = Sender,
+                                     flow   = Flow},
+                SlaveWhenPublished},
+            State = #q{senders = Senders, overflow = Overflow}) ->
     Senders1 = case Flow of
     %% In both credit_flow:ack/1 we are acking messages to the channel
     %% process that sent us the message delivery. See handle_ch_down
@@ -1266,7 +1307,17 @@ handle_cast({deliver, Delivery = #delivery{sender = Sender,
                    noflow -> Senders
                end,
     State1 = State#q{senders = Senders1},
-    noreply(deliver_or_enqueue(Delivery, SlaveWhenPublished, State1));
+    case {will_overflow(Delivery, State1), Overflow} of
+        {false, _} ->
+            noreply(deliver_or_enqueue(Delivery, SlaveWhenPublished, State1));
+        %% Drop will be performed by deliver_or_enqueue
+        %% TODO: refactor to have explicit drop here.
+        {true, drop_head} ->
+            noreply(deliver_or_enqueue(Delivery, SlaveWhenPublished, State1));
+        %% TODO: deal with mandatory flag
+        {true, reject_publish} ->
+            noreply(nack_publish_no_space(Delivery, SlaveWhenPublished, State1))
+    end;
 %% [0] The second ack is since the channel thought we were a slave at
 %% the time it published this message, so it used two credits (see
 %% rabbit_amqqueue:deliver/2).

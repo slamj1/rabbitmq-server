@@ -578,6 +578,12 @@ handle_cast({mandatory_received, MsgSeqNo}, State = #ch{mandatory = Mand}) ->
     %% NB: don't call noreply/1 since we don't want to send confirms.
     noreply_coalesce(State#ch{mandatory = dtree:drop(MsgSeqNo, Mand)});
 
+handle_cast({reject_publish, MsgSeqNo, QPid}, State = #ch{unconfirmed = UC}) ->
+    {MXs, UC1} = dtree:take([MsgSeqNo], QPid, UC),
+    %% NB: don't call noreply/1 since we don't want to send confirms.
+    %% TODO: mandatory
+    noreply_coalesce(send_nacks(MXs, State#ch{unconfirmed = UC1}));
+
 handle_cast({confirm, MsgSeqNos, QPid}, State = #ch{unconfirmed = UC}) ->
     {MXs, UC1} = dtree:take(MsgSeqNos, QPid, UC),
     %% NB: don't call noreply/1 since we don't want to send confirms.
@@ -798,7 +804,7 @@ check_topic_authorisation(#exchange{name = Name = #resource{virtual_host = VHost
                           RoutingKey,
                           Permission) ->
     Resource = Name#resource{kind = topic},
-    Timeout = get_operation_timeout(),   
+    Timeout = get_operation_timeout(),
     AmqpParams = case ConnPid of
                      none ->
                          %% Called from outside the channel by mgmt API
