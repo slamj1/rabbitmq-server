@@ -700,10 +700,14 @@ maybe_drop_head(AlreadyDropped, State = #q{backing_queue       = BQ,
 
 nack_publish_no_space(#delivery{confirm = true,
                                 sender = SenderPid,
-                                msg_seq_no = MsgSeqNo},
-                      _SlaveWhenPublished, State) ->
+                                msg_seq_no = MsgSeqNo} = Delivery,
+                      _SlaveWhenPublished,
+                      State = #q{ backing_queue = BQ,
+                                  backing_queue_state = BQS,
+                                  msg_id_to_channel   = MTC}) ->
+    {BQS1, MTC1} = discard(Delivery, BQ, BQS, MTC),
     gen_server2:cast(SenderPid, {reject_publish, MsgSeqNo, self()}),
-    State;
+    State#q{ backing_queue_state = BQS1, msg_id_to_channel = MTC1 };
 nack_publish_no_space(#delivery{confirm = false},
                       _SlaveWhenPublished, State) ->
     State.
