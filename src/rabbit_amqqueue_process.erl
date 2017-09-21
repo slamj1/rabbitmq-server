@@ -1316,6 +1316,7 @@ handle_cast({deliver,
             noreply(deliver_or_enqueue(Delivery, SlaveWhenPublished, State1));
         %% TODO: deal with mandatory flag
         {true, reject_publish} ->
+            send_mandatory(Delivery), %% Message is routed, but will be rejected
             noreply(nack_publish_no_space(Delivery, SlaveWhenPublished, State1))
     end;
 %% [0] The second ack is since the channel thought we were a slave at

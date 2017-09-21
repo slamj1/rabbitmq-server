@@ -429,6 +429,7 @@ prioritise_call(Msg, _From, _Len, _State) ->
 prioritise_cast(Msg, _Len, _State) ->
     case Msg of
         {confirm,            _MsgSeqNos, _QPid} -> 5;
+        {reject_publish,     _MsgSeqNos, _QPid} -> 5;
         {mandatory_received, _MsgSeqNo,  _QPid} -> 5;
         _                                       -> 0
     end.
@@ -581,7 +582,6 @@ handle_cast({mandatory_received, MsgSeqNo}, State = #ch{mandatory = Mand}) ->
 handle_cast({reject_publish, MsgSeqNo, QPid}, State = #ch{unconfirmed = UC}) ->
     {MXs, UC1} = dtree:take([MsgSeqNo], QPid, UC),
     %% NB: don't call noreply/1 since we don't want to send confirms.
-    %% TODO: mandatory
     noreply_coalesce(send_nacks(MXs, State#ch{unconfirmed = UC1}));
 
 handle_cast({confirm, MsgSeqNos, QPid}, State = #ch{unconfirmed = UC}) ->
